@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+*.log
+shots/
+*.db
+
+# Scratch / temp files
+out*.txt
+err*.txt
+*uia_probe.py
