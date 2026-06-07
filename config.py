@@ -18,6 +18,10 @@ def _ids(name):
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 ALLOWED_USER_IDS = _ids("ALLOWED_USER_IDS")
 COMMAND_CHANNEL_IDS = _ids("COMMAND_CHANNEL_IDS")  # empty = any channel
+# Bot user-ids permitted to drive Ping for live/regression testing. Empty in
+# production (default), so bot-authored messages are ignored as usual. When set,
+# these ids bypass the bot-author skip AND are treated as authorized.
+TEST_AUTHOR_IDS = _ids("TEST_AUTHOR_IDS")
 COMMAND_PREFIX = (os.getenv("COMMAND_PREFIX", "!").strip() or "!")
 
 SHELL_TIMEOUT = int(os.getenv("SHELL_TIMEOUT", "60"))

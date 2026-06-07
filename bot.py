@@ -57,9 +57,15 @@ STOP_WORDS = {"stop", "abort", "cancel", "halt"}
 
 
 # ---------- security gate ----------
+def _is_authorized_user(user_id):
+    if user_id in config.TEST_AUTHOR_IDS:
+        return True
+    return not config.ALLOWED_USER_IDS or user_id in config.ALLOWED_USER_IDS
+
+
 @bot.check
 async def _authorized(ctx):
-    if config.ALLOWED_USER_IDS and ctx.author.id not in config.ALLOWED_USER_IDS:
+    if not _is_authorized_user(ctx.author.id):
         return False
     if config.COMMAND_CHANNEL_IDS and ctx.channel.id not in config.COMMAND_CHANNEL_IDS:
         return False
@@ -90,7 +96,7 @@ async def on_ready():
 
 
 def _allowed(message):
-    if config.ALLOWED_USER_IDS and message.author.id not in config.ALLOWED_USER_IDS:
+    if not _is_authorized_user(message.author.id):
         return False
     if config.COMMAND_CHANNEL_IDS and message.channel.id not in config.COMMAND_CHANNEL_IDS:
         return False
@@ -194,11 +200,18 @@ async def dispatch(channel, action):
 
 @bot.event
 async def on_message(message):
-    if message.author.bot:
+    # A configured tester bot is allowed; every other bot (including ourself) is ignored.
+    is_test_author = message.author.id in config.TEST_AUTHOR_IDS
+    if message.author.bot and not is_test_author:
         return
     ctx = await bot.get_context(message)
     if ctx.valid:  # it's a !command -> normal command handling (with its own auth check)
-        await bot.process_commands(message)
+        # process_commands() skips bot authors, so for the tester bot we invoke
+        # the command directly (the _authorized check still gates it).
+        if is_test_author:
+            await bot.invoke(ctx)
+        else:
+            await bot.process_commands(message)
         return
     # Not a command: route plain English through the brain (auth-gated).
     content = message.content.strip()
