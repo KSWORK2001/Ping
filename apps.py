@@ -127,6 +127,34 @@ def launch_direct(name):
         return f"Could not launch '{name}': {e}"
 
 
+def maximize_active():
+    """Maximize the current foreground window so the agent acts on a large,
+    predictable layout. Reaching controls like a chat's message box in a small or
+    restored window was causing stray clicks that minimized the app. This MUST run
+    before the screenshot is captured each step, so the model's coordinates match
+    the maximized window. No-op if already maximized or if no real app window is in
+    front (e.g. the desktop). Never raises."""
+    try:
+        import pygetwindow as gw
+    except Exception as e:
+        return f"maximize unavailable: {e}"
+    try:
+        w = gw.getActiveWindow()
+    except Exception as e:
+        return f"maximize failed: {e}"
+    if not w or not (w.title or "").strip():
+        return "no active window to maximize"
+    try:
+        if getattr(w, "isMinimized", False):
+            w.restore()
+        if getattr(w, "isMaximized", False):
+            return f"already maximized: {w.title}"
+        w.maximize()
+        return f"maximized: {w.title}"
+    except Exception as e:
+        return f"maximize failed: {e}"
+
+
 def focus(name):
     name = name.lower().strip()
     needle = TITLES.get(name, name)

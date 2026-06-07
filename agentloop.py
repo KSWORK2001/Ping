@@ -349,6 +349,11 @@ async def run(channel, task, post_image, max_steps=None, seed_history=None, anno
     if announce:
         await channel.send(f"Starting task (up to {max_steps} steps): **{task}**\nSend `stop` to abort.")
     for step in range(1, max_steps + 1):
+        # Maximize the target window FIRST, before capturing, so the layout the
+        # model sees (and computes click coordinates from) matches what we click.
+        if config.AGENT_MAXIMIZE_ACTIVE:
+            await asyncio.to_thread(apps.maximize_active)
+            await asyncio.sleep(0.3)  # let the window finish maximizing
         disp_w, disp_h, sx, sy, off_x, off_y = await asyncio.to_thread(_capture_for_agent, path)
         windows = await asyncio.to_thread(system.list_windows)
         active = await asyncio.to_thread(system.active_window_title)
@@ -495,6 +500,11 @@ async def replay(channel, workflow, post_image):
         action = st["action"]
         atype = (action.get("type") or "").lower()
         meta = st.get("element")
+        # Maximize first (same reason as the live loop) so recorded coords + element
+        # relocation resolve against the same large layout they were captured on.
+        if config.AGENT_MAXIMIZE_ACTIVE:
+            await asyncio.to_thread(apps.maximize_active)
+            await asyncio.sleep(0.3)
         # Re-capture each step so element relocation + coord scaling use the live screen.
         _, _, sx, sy, off_x, off_y = await asyncio.to_thread(_capture_for_agent, path)
 

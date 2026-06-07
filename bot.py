@@ -412,6 +412,17 @@ async def clickdebug_cmd(ctx, mode: str = ""):
     await ctx.send(f"Click-debug overlay is {'ON' if config.AGENT_DEBUG_CLICKS else 'OFF'}.")
 
 
+@bot.command(name="maximize")
+async def maximize_cmd(ctx, mode: str = ""):
+    """!maximize [on|off]  - toggle maximizing the target window before each agent step."""
+    m = mode.strip().lower()
+    if m in ("on", "1", "true", "yes"):
+        config.AGENT_MAXIMIZE_ACTIVE = True
+    elif m in ("off", "0", "false", "no"):
+        config.AGENT_MAXIMIZE_ACTIVE = False
+    await ctx.send(f"Maximize-before-click is {'ON' if config.AGENT_MAXIMIZE_ACTIVE else 'OFF'}.")
+
+
 # ---------- vision agent loop ----------
 @bot.command(name="do")
 async def do_cmd(ctx, *, task):
@@ -537,6 +548,7 @@ async def cmds(ctx):
         "`!open <app>` / `!focus <app>` - teams, outlook, claude, cowork...\n"
         "`!type <text>` `!key ctrl+c` `!click x y` `!screensize` - automation\n"
         "`!aim x y` / `!clickdebug on|off` / `!coordcheck` - debug click accuracy\n"
+        "`!maximize on|off` - maximize the target window before each agent step\n"
         "`!golive` - best-effort Discord screen-share"
     )
 

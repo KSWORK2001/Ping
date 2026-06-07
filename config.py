@@ -79,6 +79,11 @@ AGENT_MAX_ELEMENTS = int(os.getenv("AGENT_MAX_ELEMENTS", "55"))
 # full-desktop screenshot with a marker at the COMPUTED click point, so you can
 # visually confirm the capture->predict->click coordinate transform.
 AGENT_DEBUG_CLICKS = os.getenv("AGENT_DEBUG_CLICKS", "false").lower() in ("1", "true", "yes", "on")
+# Before each step, maximize the foreground (target) window so clicks/typing hit
+# a large, predictable layout. Reaching controls like the message box in a small
+# or restored window was causing stray clicks that minimized the app. Toggle live
+# with !maximize on/off.
+AGENT_MAXIMIZE_ACTIVE = os.getenv("AGENT_MAXIMIZE_ACTIVE", "true").lower() in ("1", "true", "yes", "on")
 # Skip MCP servers on internal router/vision calls (faster, can't hang on MCP).
 CLAUDE_NO_MCP = os.getenv("CLAUDE_NO_MCP", "true").lower() in ("1", "true", "yes", "on")
 WORKDIR = os.getenv("WORKDIR", PROJECT_DIR)
