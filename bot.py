@@ -12,14 +12,27 @@ import io
 import sys
 
 # Per-monitor-v2 DPI awareness MUST be set before pyautogui/mss are imported so
-# that UIA element rectangles and pyautogui click coordinates share one space.
+# that mss screenshots and pyautogui's SetCursorPos share ONE coordinate space
+# (physical pixels). If this silently fails on a scaled display, screenshots stay
+# physical while clicks become logical -> a proportional overshoot. We record
+# which mode took effect (logged in on_ready) so that failure is visible.
+DPI_MODE = "none"
 try:
-    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    # -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+        DPI_MODE = "per-monitor-v2"
+    else:
+        raise OSError("SetProcessDpiAwarenessContext returned 0")
 except Exception:
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # 2 = PER_MONITOR_AWARE (v1)
+        DPI_MODE = "per-monitor-v1"
     except Exception:
-        pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()  # legacy system-DPI aware
+            DPI_MODE = "system"
+        except Exception:
+            DPI_MODE = "FAILED"
 
 import discord
 from discord.ext import commands
@@ -35,6 +48,8 @@ import live
 import brain
 import agentloop
 import workflows
+import selftest
+import dashboard
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -57,15 +72,9 @@ STOP_WORDS = {"stop", "abort", "cancel", "halt"}
 
 
 # ---------- security gate ----------
-def _is_authorized_user(user_id):
-    if user_id in config.TEST_AUTHOR_IDS:
-        return True
-    return not config.ALLOWED_USER_IDS or user_id in config.ALLOWED_USER_IDS
-
-
 @bot.check
 async def _authorized(ctx):
-    if not _is_authorized_user(ctx.author.id):
+    if config.ALLOWED_USER_IDS and ctx.author.id not in config.ALLOWED_USER_IDS:
         return False
     if config.COMMAND_CHANNEL_IDS and ctx.channel.id not in config.COMMAND_CHANNEL_IDS:
         return False
@@ -87,16 +96,41 @@ async def send_shot(channel, monitor=0):
 
 
 # ---------- lifecycle ----------
+def _dashboard_state():
+    """Bot-specific counters for the status dashboard."""
+    return {
+        "ready": bot.is_ready(),
+        "bot_user": str(bot.user) if bot.user else None,
+        "latency_ms": round(bot.latency * 1000) if bot.latency else None,
+        "running_tasks": sum(1 for t in _agent_tasks.values() if not t.done()),
+        "watchers": len(_watchers),
+    }
+
+
 @bot.event
 async def on_ready():
     loop = asyncio.get_running_loop()
     logger.info("online as %s (id %s); event loop = %s", bot.user, bot.user.id, type(loop).__name__)
+    logger.info("DPI awareness mode: %s", DPI_MODE)
+    if DPI_MODE in ("FAILED", "system", "none"):
+        logger.warning("DPI awareness is %r - clicks may be miscaled on scaled displays", DPI_MODE)
     logger.info("allowed users: %s", config.ALLOWED_USER_IDS or "ANYONE")
     print(f"[Ping] online as {bot.user}; loop={type(loop).__name__}", flush=True)
+    dashboard.event(f"online as {bot.user}")
+    await dashboard.start(bot, _dashboard_state)
+    # Empirical click-accuracy self-check (no clicking) - flags a bad DPI/coord
+    # state in the log before the first real click.
+    report = await asyncio.to_thread(agentloop.coord_selfcheck, DPI_MODE)
+    if report.get("ok"):
+        logger.info("coord self-check OK: %s", report)
+    else:
+        logger.warning("coord self-check FOUND ISSUES: %s", report)
+        print(f"[Ping] WARNING: click-accuracy: {'; '.join(report.get('warnings', []))}", flush=True)
+    dashboard.event(f"coord check: {'OK' if report.get('ok') else 'WARN - ' + '; '.join(report.get('warnings', []))[:80]}")
 
 
 def _allowed(message):
-    if not _is_authorized_user(message.author.id):
+    if config.ALLOWED_USER_IDS and message.author.id not in config.ALLOWED_USER_IDS:
         return False
     if config.COMMAND_CHANNEL_IDS and message.channel.id not in config.COMMAND_CHANNEL_IDS:
         return False
@@ -109,6 +143,7 @@ async def _drive(channel, task, coro):
     if channel.id in _agent_tasks and not _agent_tasks[channel.id].done():
         await channel.send("A task is already running here. Send `stop` first.")
         return None
+    dashboard.event(f"▶ task: {str(task)[:80]}")
     t = asyncio.create_task(coro)
     _agent_tasks[channel.id] = t
     result = None
@@ -126,6 +161,7 @@ async def _drive(channel, task, coro):
             "history": result["history"],
             "completed": result.get("completed", False),
         }
+        dashboard.event(f"{'✅' if result.get('completed') else '⏹'} task: {str(task)[:60]}")
     return result
 
 
@@ -167,6 +203,7 @@ async def dispatch(channel, action):
     """Execute a structured action chosen by the natural-language brain."""
     a = (action.get("action") or "").lower()
     logger.info("dispatch: %s", a)
+    dashboard.event(f"→ {a}")
     if a == "agent_task":
         await run_agent(channel, action.get("task") or action.get("prompt", ""))
         return
@@ -200,18 +237,13 @@ async def dispatch(channel, action):
 
 @bot.event
 async def on_message(message):
-    # A configured tester bot is allowed; every other bot (including ourself) is ignored.
-    is_test_author = message.author.id in config.TEST_AUTHOR_IDS
-    if message.author.bot and not is_test_author:
+    if message.author.bot:
         return
+    if _allowed(message) and message.content.strip():
+        dashboard.event(f"⌨ {message.author.display_name}: {message.content[:80]}")
     ctx = await bot.get_context(message)
     if ctx.valid:  # it's a !command -> normal command handling (with its own auth check)
-        # process_commands() skips bot authors, so for the tester bot we invoke
-        # the command directly (the _authorized check still gates it).
-        if is_test_author:
-            await bot.invoke(ctx)
-        else:
-            await bot.process_commands(message)
+        await bot.process_commands(message)
         return
     # Not a command: route plain English through the brain (auth-gated).
     content = message.content.strip()
@@ -340,6 +372,46 @@ async def screensize(ctx):
     await ctx.send(await asyncio.to_thread(automation.screen_size))
 
 
+@bot.command(name="aim")
+async def aim_cmd(ctx, x: int, y: int):
+    """!aim <x> <y>  - verify click accuracy: x,y in the model's display space
+    (the red-grid coords on the agent screenshot). Moves the mouse to the
+    computed point and posts an overlay marking the exact target so you can see
+    if it lands where you expect."""
+    async with ctx.typing():
+        overlay, px, py, info = await asyncio.to_thread(agentloop.debug_aim, x, y)
+    await ctx.send(f"Aim: {info}\nMouse moved to physical ({px}, {py}). Green crosshair = computed target.")
+    await ctx.send(file=discord.File(overlay, filename="aim.png"))
+
+
+@bot.command(name="coordcheck")
+async def coordcheck_cmd(ctx):
+    """!coordcheck  - re-run the click-accuracy / DPI self-check and report."""
+    async with ctx.typing():
+        r = await asyncio.to_thread(agentloop.coord_selfcheck, DPI_MODE)
+    head = "OK ✅" if r.get("ok") else "ISSUES ❌"
+    lines = [f"**Coord self-check: {head}**",
+             f"DPI mode: `{r.get('dpi_mode')}`",
+             f"capture {r.get('display')} scale {r.get('scale')} offset {r.get('offset')}",
+             f"physical {r.get('captured_physical')} | OS primary {r.get('os_primary')} "
+             f"(ratio {r.get('physical_vs_os_ratio', 'n/a')})",
+             f"round-trip error: {r.get('roundtrip_px_error')}px"]
+    if r.get("warnings"):
+        lines.append("warnings:\n- " + "\n- ".join(r["warnings"]))
+    await ctx.send("\n".join(lines))
+
+
+@bot.command(name="clickdebug")
+async def clickdebug_cmd(ctx, mode: str = ""):
+    """!clickdebug [on|off]  - toggle posting a click-target overlay each agent step."""
+    m = mode.strip().lower()
+    if m in ("on", "1", "true", "yes"):
+        config.AGENT_DEBUG_CLICKS = True
+    elif m in ("off", "0", "false", "no"):
+        config.AGENT_DEBUG_CLICKS = False
+    await ctx.send(f"Click-debug overlay is {'ON' if config.AGENT_DEBUG_CLICKS else 'OFF'}.")
+
+
 # ---------- vision agent loop ----------
 @bot.command(name="do")
 async def do_cmd(ctx, *, task):
@@ -421,6 +493,25 @@ async def flow_cmd(ctx, sub, *, name=""):
         await ctx.send("Usage: `!flow show <name>` or `!flow rm <name>`.")
 
 
+# ---------- self-test (live regression) ----------
+@bot.command(name="selftest")
+async def selftest_cmd(ctx, *, only=""):
+    """!selftest [names|nogui]  - run live regression tests against this PC."""
+    await selftest.run(ctx.channel, dispatch, brain.decide, only)
+
+
+@bot.command(name="dash")
+async def dash_cmd(ctx):
+    """!dash  - show the local status dashboard URL."""
+    if not config.DASHBOARD_ENABLED:
+        await ctx.send("Dashboard is disabled (set DASHBOARD_ENABLED=true).")
+        return
+    await ctx.send(
+        f"Status dashboard: http://{config.DASHBOARD_HOST}:{config.DASHBOARD_PORT}\n"
+        f"(reachable from this PC; set DASHBOARD_HOST=0.0.0.0 for LAN access)"
+    )
+
+
 # ---------- live screen share (best-effort) ----------
 @bot.command()
 async def golive(ctx):
@@ -441,8 +532,11 @@ async def cmds(ctx):
         "`!do <goal>` / `stop` - multi-step task, Claude watches the screen each step\n"
         "`!save <name>` - save the last finished task as a workflow\n"
         "`!flows` / `!runflow <name>` / `!flow show|rm <name>` - saved workflows\n"
+        "`!selftest [names|nogui]` - run live regression tests on this PC\n"
+        "`!dash` - local status dashboard URL\n"
         "`!open <app>` / `!focus <app>` - teams, outlook, claude, cowork...\n"
         "`!type <text>` `!key ctrl+c` `!click x y` `!screensize` - automation\n"
+        "`!aim x y` / `!clickdebug on|off` / `!coordcheck` - debug click accuracy\n"
         "`!golive` - best-effort Discord screen-share"
     )
 

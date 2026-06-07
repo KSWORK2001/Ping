@@ -9,6 +9,7 @@ import json
 import os
 import re
 
+import discord
 import mss
 from PIL import Image, ImageDraw
 
@@ -30,14 +31,26 @@ def _format_elements(els):
     return "\n".join(f'[{i + 1}] {e["type"]} "{e["name"]}"' for i, e in enumerate(els))
 
 
-def _draw_marks(path, els, sx, sy):
-    """Overlay each element's id number at its position (Set-of-Marks)."""
+def _to_physical(x_disp, y_disp, sx, sy, off_x, off_y):
+    """Convert a model coordinate (display space, relative to the captured
+    monitor) into an ABSOLUTE virtual-desktop physical pixel that pyautogui's
+    SetCursorPos expects. Undoes the downscale (sx/sy) AND adds the captured
+    monitor's origin (off_x/off_y) so multi-monitor layouts land correctly."""
+    return round(x_disp * sx) + off_x, round(y_disp * sy) + off_y
+
+
+def _draw_marks(path, els, sx, sy, off_x=0, off_y=0):
+    """Overlay each element's id number at its position (Set-of-Marks).
+
+    Element cx/cy are absolute virtual-desktop pixels, but the image is the
+    downscaled, monitor-relative capture - so subtract the monitor origin before
+    scaling down, or the marks drift on multi-monitor setups."""
     if not els:
         return
     img = Image.open(path).convert("RGB")
     d = ImageDraw.Draw(img)
     for i, e in enumerate(els):
-        x, y = int(e["cx"] / sx), int(e["cy"] / sy)
+        x, y = int((e["cx"] - off_x) / sx), int((e["cy"] - off_y) / sy)
         label = str(i + 1)
         w = 7 * len(label) + 3
         d.rectangle([x - 1, y - 7, x - 1 + w, y + 7], fill=(200, 0, 200))
@@ -85,7 +98,7 @@ Next-action shape:
   {{"thought":"<one short sentence>","action":{{"type":"<type>", ...}}}}
 Action types and fields:
   click_element (PREFERRED for clicking) : {{"type":"click_element","id":N}}   (N from the CLICKABLE ELEMENTS list)
-  click / double_click / right_click : {{"type":"click","x":N,"y":N}}
+  click / double_click / right_click : {{"type":"click","x":N,"y":N}}   (or give a bounding box and we click its exact center: {{"type":"click","box":[x1,y1,x2,y2]}})
   move                               : {{"type":"move","x":N,"y":N}}
   scroll                             : {{"type":"scroll","amount":-500}}   (negative = down)
   type                               : {{"type":"type","text":"hello"}}
@@ -129,14 +142,16 @@ def _capture_for_agent(path):
     """Capture the primary monitor, downscale to AGENT_IMAGE_WIDTH, and draw a
     labeled coordinate grid to help Claude target clicks.
 
-    Returns (disp_w, disp_h, scale_x, scale_y) where scale_* convert a coordinate
-    in the displayed (downscaled) image back to a physical screen pixel.
+    Returns (disp_w, disp_h, scale_x, scale_y, off_x, off_y): scale_* undo the
+    downscale and off_* are the captured monitor's virtual-desktop origin. Feed
+    all six to _to_physical() to turn a model coordinate into an absolute click.
     """
     with mss.MSS() as sct:
         mons = sct.monitors
         mon = mons[1] if len(mons) > 1 else mons[0]
         shot = sct.grab(mon)
         img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+    off_x, off_y = mon["left"], mon["top"]
 
     phys_w, phys_h = img.size
     disp_w = min(config.AGENT_IMAGE_WIDTH, phys_w)
@@ -163,7 +178,109 @@ def _capture_for_agent(path):
             screen._draw_cursor(small, cx, cy)
 
     small.save(path, format="PNG")
-    return disp_w, disp_h, phys_w / disp_w, phys_h / disp_h
+    return disp_w, disp_h, phys_w / disp_w, phys_h / disp_h, off_x, off_y
+
+
+def save_click_overlay(phys_x, phys_y, label, path):
+    """Capture the FULL virtual desktop and draw a marker at the absolute physical
+    point (phys_x, phys_y). This is the ground-truth check: the green crosshair is
+    exactly where the next click will land, so you can eyeball it against the real
+    target (and the real mouse cursor)."""
+    with mss.MSS() as sct:
+        vmon = sct.monitors[0]  # union rectangle of all monitors
+        shot = sct.grab(vmon)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+    x, y = phys_x - vmon["left"], phys_y - vmon["top"]  # into the image's frame
+    d = ImageDraw.Draw(img)
+    r = 28
+    d.ellipse([x - r, y - r, x + r, y + r], outline=(0, 255, 0), width=4)
+    d.line([(x - r - 14, y), (x + r + 14, y)], fill=(0, 255, 0), width=2)
+    d.line([(x, y - r - 14), (x, y + r + 14)], fill=(0, 255, 0), width=2)
+    d.ellipse([x - 3, y - 3, x + 3, y + 3], fill=(255, 0, 0))
+    d.text((x + r + 8, y - 8), label, fill=(0, 255, 0))
+    if img.width > 1920:  # keep the upload small
+        ratio = 1920 / img.width
+        img = img.resize((1920, int(img.height * ratio)))
+    img.save(path, format="PNG")
+    return path
+
+
+def coord_selfcheck(dpi_mode="unknown"):
+    """Startup sanity check for the click coordinate path. NO clicking - it only
+    captures, runs _to_physical round-trips, and compares mss's physical capture
+    size against the OS-reported screen metrics to catch a DPI-awareness mismatch
+    (the classic cause of proportional click overshoot). Returns a report dict and
+    appends human-readable warnings; never raises."""
+    import ctypes
+    report = {"dpi_mode": dpi_mode, "ok": True, "warnings": []}
+    try:
+        tmp = os.path.join(config.WORKDIR, "shots", "selfcheck.png")
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        disp_w, disp_h, sx, sy, ox, oy = _capture_for_agent(tmp)
+        phys_w, phys_h = round(disp_w * sx), round(disp_h * sy)
+        report.update({
+            "display": [disp_w, disp_h], "scale": [round(sx, 4), round(sy, 4)],
+            "offset": [ox, oy], "captured_physical": [phys_w, phys_h],
+        })
+
+        # 1) _to_physical round-trip: map display -> physical -> back, expect ~identity.
+        max_err = 0.0
+        for xd, yd in [(0, 0), (disp_w // 2, disp_h // 2), (disp_w - 1, disp_h - 1)]:
+            px, py = _to_physical(xd, yd, sx, sy, ox, oy)
+            bx, by = (px - ox) / sx, (py - oy) / sy  # inverse transform
+            max_err = max(max_err, abs(bx - xd), abs(by - yd))
+        report["roundtrip_px_error"] = round(max_err, 3)
+        if max_err > 2.0:
+            report["ok"] = False
+            report["warnings"].append(f"coordinate round-trip error {max_err:.1f}px (>2)")
+
+        # 2) mss physical size vs OS-reported PRIMARY screen size. With effective
+        # per-monitor/system DPI awareness these match; if the process is being DPI
+        # virtualized, GetSystemMetrics returns LOGICAL (scaled-down) pixels while
+        # mss returns physical -> the exact ratio clicks would overshoot by.
+        try:
+            u = ctypes.windll.user32
+            os_w = u.GetSystemMetrics(0)  # SM_CXSCREEN (primary, process coord space)
+            os_h = u.GetSystemMetrics(1)  # SM_CYSCREEN
+            report["os_primary"] = [os_w, os_h]
+            if ox == 0 and oy == 0 and os_w and phys_w:  # captured monitor IS primary
+                ratio = phys_w / os_w
+                report["physical_vs_os_ratio"] = round(ratio, 4)
+                if abs(ratio - 1.0) > 0.02:
+                    report["ok"] = False
+                    report["warnings"].append(
+                        f"capture is {phys_w}px wide but OS reports {os_w}px (ratio {ratio:.2f}); "
+                        f"clicks likely overshoot ~{ratio:.2f}x - DPI awareness not effective")
+        except Exception as e:
+            report["warnings"].append(f"OS metric check skipped: {e}")
+
+        # 3) DPI mode advisory.
+        if dpi_mode in ("FAILED", "none"):
+            report["ok"] = False
+            report["warnings"].append(f"DPI awareness is {dpi_mode!r} - set per-monitor before clicking")
+        elif dpi_mode == "system":
+            report["warnings"].append("DPI awareness is system-level only; multi-monitor mixed-DPI clicks may drift")
+    except Exception as e:
+        report["ok"] = False
+        report["warnings"].append(f"selfcheck failed: {e}")
+    return report
+
+
+def debug_aim(x_disp, y_disp):
+    """For the !aim command: take a model-space (display) coordinate, run it
+    through the exact same transform a real click uses, move the mouse there, and
+    return an annotated overlay + the transform details for verification."""
+    shots_dir = os.path.join(config.WORKDIR, "shots")
+    os.makedirs(shots_dir, exist_ok=True)
+    cap = os.path.join(shots_dir, "aim_capture.png")
+    disp_w, disp_h, sx, sy, ox, oy = _capture_for_agent(cap)
+    px, py = _to_physical(x_disp, y_disp, sx, sy, ox, oy)
+    automation.move(px, py)  # move only (no click) so it's safe to test
+    overlay = os.path.join(shots_dir, "aim_overlay.png")
+    save_click_overlay(px, py, f"({x_disp},{y_disp})->({px},{py})", overlay)
+    info = (f"display=({x_disp},{y_disp}) in {disp_w}x{disp_h} | "
+            f"scale=({sx:.3f},{sy:.3f}) offset=({ox},{oy}) -> physical=({px},{py})")
+    return overlay, px, py, info
 
 
 def _execute(action):
@@ -232,12 +349,12 @@ async def run(channel, task, post_image, max_steps=None, seed_history=None, anno
     if announce:
         await channel.send(f"Starting task (up to {max_steps} steps): **{task}**\nSend `stop` to abort.")
     for step in range(1, max_steps + 1):
-        disp_w, disp_h, sx, sy = await asyncio.to_thread(_capture_for_agent, path)
+        disp_w, disp_h, sx, sy, off_x, off_y = await asyncio.to_thread(_capture_for_agent, path)
         windows = await asyncio.to_thread(system.list_windows)
         active = await asyncio.to_thread(system.active_window_title)
         if config.AGENT_USE_UIA:
             _, els = await asyncio.to_thread(elements.enumerate_active, config.AGENT_MAX_ELEMENTS)
-            await asyncio.to_thread(_draw_marks, path, els, sx, sy)
+            await asyncio.to_thread(_draw_marks, path, els, sx, sy, off_x, off_y)
         else:
             els = []
         logger.info("step %d: active=%r elements=%d", step, active[:40], len(els))
@@ -263,6 +380,7 @@ async def run(channel, task, post_image, max_steps=None, seed_history=None, anno
         action = decision.get("action") or {}
         atype = (action.get("type") or "").lower()
         element_meta = None  # set when we click a named accessibility element
+        click_pt = None      # absolute physical point we acted on (for debug overlay)
 
         if atype == "click_element":
             idx = action.get("id")
@@ -272,18 +390,42 @@ async def run(channel, task, post_image, max_steps=None, seed_history=None, anno
                 result = f"invalid element id {idx}"
             else:
                 element_meta = {"name": el["name"], "type": el["type"]}
+                click_pt = (el["cx"], el["cy"])  # already absolute physical
                 await channel.send(f'**Step {step}** - {thought}\nclick [{idx}] {el["type"]} "{el["name"]}"')
                 result = await asyncio.to_thread(automation.click, el["cx"], el["cy"])
         else:
-            # Scale display-space coordinates from the model up to physical pixels.
+            # Convert display-space coordinates to absolute physical pixels.
             exec_action = dict(action)
-            if "x" in exec_action:
-                exec_action["x"] = round(exec_action["x"] * sx)
-            if "y" in exec_action:
-                exec_action["y"] = round(exec_action["y"] * sy)
+            box = action.get("box")
+            if isinstance(box, (list, tuple)) and len(box) == 4:
+                # Model returned a bounding box -> click its center.
+                xd = (float(box[0]) + float(box[2])) / 2
+                yd = (float(box[1]) + float(box[3])) / 2
+                exec_action.pop("box", None)
+                exec_action["x"], exec_action["y"] = _to_physical(xd, yd, sx, sy, off_x, off_y)
+            elif "x" in exec_action and "y" in exec_action:
+                exec_action["x"], exec_action["y"] = _to_physical(
+                    exec_action["x"], exec_action["y"], sx, sy, off_x, off_y)
+            else:  # a stray single axis (rare)
+                if "x" in exec_action:
+                    exec_action["x"] = round(exec_action["x"] * sx) + off_x
+                if "y" in exec_action:
+                    exec_action["y"] = round(exec_action["y"] * sy) + off_y
+            if "x" in exec_action and "y" in exec_action:
+                click_pt = (exec_action["x"], exec_action["y"])
             await channel.send(f"**Step {step}** - {thought}\n`{json.dumps(action)}`")
             result = await asyncio.to_thread(_execute, exec_action)
 
+        if click_pt:
+            logger.info("step %d click target (physical) = %s", step, click_pt)
+            if config.AGENT_DEBUG_CLICKS:
+                try:
+                    dbg = os.path.join(shots_dir, f"click_debug_{step}.png")
+                    await asyncio.to_thread(save_click_overlay, click_pt[0], click_pt[1],
+                                            f"step {step} target", dbg)
+                    await channel.send(file=discord.File(dbg, filename=f"click_{step}.png"))
+                except Exception as e:
+                    logger.warning("click overlay failed: %s", e)
         logger.info("step %d acted: %s -> %s", step, json.dumps(action)[:200], result)
         history.append({
             "step": len(history) + 1, "action": action,
@@ -354,7 +496,7 @@ async def replay(channel, workflow, post_image):
         atype = (action.get("type") or "").lower()
         meta = st.get("element")
         # Re-capture each step so element relocation + coord scaling use the live screen.
-        _, _, sx, sy = await asyncio.to_thread(_capture_for_agent, path)
+        _, _, sx, sy, off_x, off_y = await asyncio.to_thread(_capture_for_agent, path)
 
         if atype == "click_element":
             _, els = await asyncio.to_thread(elements.enumerate_active, config.AGENT_MAX_ELEMENTS)
@@ -369,10 +511,14 @@ async def replay(channel, workflow, post_image):
             result = await asyncio.to_thread(automation.click, el["cx"], el["cy"])
         else:
             exec_action = dict(action)
-            if "x" in exec_action:
-                exec_action["x"] = round(exec_action["x"] * sx)
-            if "y" in exec_action:
-                exec_action["y"] = round(exec_action["y"] * sy)
+            if "x" in exec_action and "y" in exec_action:
+                exec_action["x"], exec_action["y"] = _to_physical(
+                    exec_action["x"], exec_action["y"], sx, sy, off_x, off_y)
+            else:
+                if "x" in exec_action:
+                    exec_action["x"] = round(exec_action["x"] * sx) + off_x
+                if "y" in exec_action:
+                    exec_action["y"] = round(exec_action["y"] * sy) + off_y
             await channel.send(f"**Step {i}/{len(steps)}** - `{json.dumps(action)}`")
             result = await asyncio.to_thread(_execute, exec_action)
             if isinstance(result, str) and result.startswith(("error:", "missing field", "unknown action")):
